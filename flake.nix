@@ -3,6 +3,7 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    logos-module-builder.inputs.logos-cpp-sdk.url = "github:logos-co/logos-cpp-sdk/logos_result_type";
     logos-storage.url =  "git+https://github.com/logos-storage/logos-storage-nim?submodules=1";
   };
 
