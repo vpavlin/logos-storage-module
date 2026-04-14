@@ -16,8 +16,6 @@ nix build '.#default'
 
 The result will include:
 - `/lib/storage_module_plugin.dylib` (or `.so` on Linux) - The Storage module plugin
-- `/include/storage_module_api.h` - Generated header for the module API
-- `/include/storage_module_api.cpp` - Generated implementation for the module API
 
 #### Build Individual Components
 
@@ -115,10 +113,7 @@ If you are using Linux with SELinux enabled, you will not be able to install Nix
 
 #### Modular Architecture
 
-The nix build system is organized into modular files in the `/nix` directory:
-- `nix/default.nix` - Common configuration (dependencies, flags, metadata)
-- `nix/lib.nix` - Module plugin and libstorage library compilation
-- `nix/include.nix` - Header generation using logos-cpp-generator
+The build system is handled by `logos-module-builder`. This module uses the **universal** interface (`"interface": "universal"` in `metadata.json`), which means any glue is auto-generated at build time from `src/storage_module_plugin.h` (via `codegen.impl_header` in `metadata.json`) by `logos-cpp-generator`.
 
 ## Output Structure
 
@@ -126,236 +121,178 @@ When built with Nix, the module produces:
 
 ```
 result/
-├── lib/
-│   └── storage_module_plugin.dylib  # Logos module plugin
-└── include/
-    ├── storage_module_api.h      # Generated API header
-    └── storage_module_api.cpp    # Generated API implementation
+└── lib/
+    └── storage_module_plugin.dylib  # Logos module plugin
 ```
 
 Both libraries must remain in the same directory, as `storage_module_plugin.dylib` is configured with `@loader_path` to find `libstorage.dylib` relative to itself.
 
-## Qt Creator (for development)
-
-Qt Creator provides a great development experience for Qt. To ensure proper integration and setup of environment variables, qtcreator must be launched from a Nix development shell: 
-```bash
-# enter nix development shell
-nix develop
-
-# launch qt creator
-# on macos, this is typically located at "/Applications/Qt\ Creator.app/Contents/MacOS/Qt\ Creator"
-path/to/qtcreator_exec
-
-### Installation
-
-#### Install from the repository
-
-If your package manager provides `qtcreator`, this is the easiest way to start. You will need to install some dependencies with it.  
-Note that you should install and run it from a Toolbox, otherwise you may face `glx` errors:
-
-```bash
-sudo dnf install cmake ninja clangd qtcreator gcc
-```
-
-If you cannot run it from inside a toolbox, try to install `chromium` in order to have proper dependencies installed.
-
-### Configuration
-
-To import the project into Qt Creator, click on `File -> Open File or Project` and select the `CMakeLists.txt` file. A configuration popup will appear. Make sure you have a **Debug** build configuration pointing to the `build` directory and then click on `Configure project`.
-
-Enable CMake debug logging, add `--log-level=DEBUG` in `Projects` -> `Imported Kits` -> `Build` -> `Additional CMake options`.
-
-Ensure that `clangd` is enabled for your project. Go to `Projects` on the left, then click on `Manage Kits` at the top. Select the `C++` tab and open the last tab, `Clangd`. Check `Use clangd` and, if needed, configure it to use the `clangd` installed on your system.
-
-That’s it. The configuration defined in `CMakeLists.txt` should allow the project to build correctly.
-
-If you encounter any configuration issues, close Qt Creator, remove the `CMakeLists.txt.user` file, and restart Qt Creator to reconfigure the project.
-
-### API
+## API
 
 This tutorial will explain how to use the API for basic operations, i.e., upload and download operations.
 
-This tutorial assumes that you already have the [sdk](https://github.com/logos-co/logos-cpp-sdk) and [logos core](https://github.com/logos-co/logos-liblogos). Please refer to the respective documentations to setup your project. 
+This tutorial assumes that you already have the [sdk](https://github.com/logos-co/logos-cpp-sdk) and [logos core](https://github.com/logos-co/logos-liblogos). Please refer to the respective documentations to setup your project.
 
-`m_logos` refers to a `LogosModules` instance that is supposed to be already created. 
+`m_logos` refers to a `LogosModules` instance that is supposed to be already created.
 
-The API has been designed to work with SDK architecture and Qt Remote Objects. Technical choices have been made with the constraints of this architecture. We assume familiarity with both.
+The API has been designed to work with the Logos SDK architecture. This module uses the **universal** interface — the implementation is plain C++ (`StorageModuleImpl`).
 
 `Logos Storage` refers to the [nim project](https://github.com/logos-storage/logos-storage-nim) hosting the actual code of the Storage engine.
 
 `Logos Storage Module` refers to this project.
 
-#### Logos Result
+#### Return types
 
-The API calls return a `LogosResult` object which contains 2 fields: `success` (boolean) and `value` (QVariant). By looking into the `success` variable, you will be able to extract the error or the actual value. The expected type has to be passed in the `getValue` accessor. The error is expected to be a string. Example:
+Methods return standard C++ types (`bool`, `std::string`, `LogosMap`, `LogosList`). Via the generated `LogosModules` wrapper, these are exposed as `QVariant`-based types following the SDK conventions.
 
-```cpp
-LogosResult result = m_logos->storage_module.someOperation(jsonConfig);
+Async operations return a session ID (`std::string`) or `bool` to confirm the command was accepted. Completion and progress are delivered through named events.
 
-if(!result.success) {
-    QString error = result.getError();
-} else {
-    int actualValue = result.getValue<int>();
-    // Or use shorthand
-    int actualValue = result.getInt();
-}
-```
+#### Events
 
-You can refer to the [SDK documentation](https://github.com/logos-co/logos-cpp-sdk/blob/c3477d29e32cae5f73ca637fb81e547f8a6cba58/README.md?plain=1#L182) for an exhaustive documentation of `LogosResult`.
+All events carry a JSON-encoded payload string. Parse it with `QJsonDocument` or pass it to `nlohmann::json`. Common fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | bool | Whether the operation succeeded |
+| `message` | string | Error description on failure |
+| `sessionId` | string | Session identifier (uploads, downloads) |
+| `cid` | string | Content identifier (on upload done) |
+| `bytes` | number | Bytes transferred (progress events) |
+| `chunk` | string | Raw data bytes (chunk-mode download) |
 
 #### Init
 
 Before using the Logos Storage Module you need to initialize it by calling the function `init`:
 
 ```cpp
-const QString jsonConfig = "{}";
-bool result = m_logos->storage_module.init(jsonConfig);
+const std::string jsonConfig = "{}";
+bool ok = m_logos->storage_module.init(jsonConfig);
 ```
 
-Note that this method returns a boolean and not a `LogosResult` because of the headless mode compability.
+You can check the possible config keys in `src/storage_module_plugin.h`.
 
-You can check the possible values of the JSON configuration in the header definition.
-
-**Important note**:
-
-You should not call `init` more than once per instance of the Logos Storage Module. Running several instances of Logos Storage requires several instances of the Storage Module and is out of the scope of this tutorial.
+**Important note**: Do not call `init` more than once per instance.
 
 #### Lifecycle
 
-Before interacting with the Logos Storage Module, you need to start the Logos Storage node. To do this, you need to run:
+Start the storage node:
 
 ```cpp
-bool result = m_logos->storage_module.start();
+bool ok = m_logos->storage_module.start();
 ```
 
-The result object returns a success if the command was successfully sent to the node, but it does not mean that the command itself was successful! To know that, you need to listen to the `storageStart` event:
+`start()` returns `true` if the command was accepted. Actual completion is delivered via the `storageStart` event:
 
 ```cpp
-m_logos->storage_module.on("storageStart", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
-
-    if (!success) {
-        QString message = data[1].toString();
-        // Handle Error
+m_logos->storage_module.on("storageStart", [this](const QVariantList& args) {
+    // args[0] is a JSON string: {"success":true,"message":""}
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    if (!obj["success"].toBool()) {
+        QString error = obj["message"].toString();
+        // Handle error
     } else {
-        // success
+        // Node is ready
     }
-})
+});
 ```
 
-The data received is a `QVariantList` containing 2 items: the boolean success and a message. If the first element is false i.e., we have a failure, then the second element contains the error message. If it is true; i.e, the operation ran successfully, the message will contain an empty string. 
-
-Similarly, the `stop` function works the same way with the `storageStop` event:
-
+Similarly, stop the node and listen for the `storageStop` event:
 
 ```cpp
-m_logos->storage_module.on("storageStop", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
-
-    if (!success) {
-        QString message = data[1].toString();
-        // Handle Error
-    } else {
-        // success
-    }
-})
-LogosResult result = m_logos->storage_module.stop();
+m_logos->storage_module.on("storageStop", [this](const QVariantList& args) {
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    bool success = obj["success"].toBool();
+});
+bool ok = m_logos->storage_module.stop();
 ```
 
 The Logos Storage Module will not stop or clean up the node automatically, and it is the application's responsibility to do so at the appropriate time (e.g. before quitting). Not shutting down the node properly can lead to data loss.
 
 **Important Note**: It is STRONGLY recommended to stop the node before cleaning up the resources. Not doing so can lead to undefined behavior (e.g. node crashing).
 
-To cleanup the resources, you can just call the synchronous `destroy` function:
+To cleanup the resources, call the synchronous `destroy` function:
 
 ```cpp
-LogosResult result = m_logos->storage_module.destroy();
+bool ok = m_logos->storage_module.destroy();
 ```
 
 #### Upload a file
 
 ##### Recommended
 
-The straightforward way to upload a file is to use the `uploadUrl` function. It works well with `FileDialog` and QML:
+The straightforward way to upload a file is to use the `uploadUrl` function, passing a local file path:
 
 ```cpp
-void upload(const QUrl& url) {
-    LogosResult result = m_logos->storage_module.uploadUrl(url);
+void upload(const std::string& filePath) {
+    std::string sessionId = m_logos->storage_module.uploadUrl(filePath);
 }
 ```
 
-You can pass an extra parameter which is the chunk size of the uploaded data. It is recommended that you keep the default value unless you have a reason to do otherwise:
+You can pass an extra parameter for the chunk size. The default is recommended for most cases:
 
 ```cpp
-void upload(const QUrl& url) {
+void upload(const std::string& filePath) {
     int chunkSize = 1024 * 64;
-    LogosResult result = m_logos->storage_module.uploadUrl(url, chunkSize);
+    std::string sessionId = m_logos->storage_module.uploadUrl(filePath, chunkSize);
 }
 ```
 
 The method is asynchronous, so again, result tells you that the command was sent to Logos Storage but it doesn't tell you that it was successful. You need to add a listener for `storageUploadDone`:
 
 ```cpp
-m_logos->storage_module.on("storageUploadDone", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
-    QString sessionId = data[1].toString();
+m_logos->storage_module.on("storageUploadDone", [this](const QVariantList& args) {
+    // args[0] is a JSON string: {"success":true,"sessionId":"...","cid":"..."}
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    bool success = obj["success"].toBool();
+    QString sessionId = obj["sessionId"].toString();
 
     if (!success) {
-        QString message = data[2].toString();
+        QString error = obj["error"].toString();
         // Handle error
     } else {
-        m_cid = data[2].toString();
+        m_cid = obj["cid"].toString();
         // Do something super cool with the CID
     }
-})
+});
 ```
 
-The callback gives 3 values:
-
-1. success: a bool that is true if it was successful
-2. sessionId: the sessionId of your upload
-3. message: The error message on failure, the CID on success
+The event payload contains `success`, `sessionId`, and either `cid` (on success) or `error` (on failure).
 
 The CID is an identifier of your content. Share it out-of-band to let other people download your content (see [download a file](#download-a-file)).
 
-That's cool but you may need to track the progress of your upload, maybe to display a nice progress bar. You can do it by adding a listener for `storageUploadProgress`.
+To track upload progress, subscribe to `storageUploadProgress`:
 
 ```cpp
-m_logos->storage_module.on("storageUploadProgress", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
-    QString sessionId = data[1].toString();
+m_logos->storage_module.on("storageUploadProgress", [this](const QVariantList& args) {
+    // args[0] is a JSON string: {"success":true,"sessionId":"...","bytes":1024}
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    bool success = obj["success"].toBool();
+    QString sessionId = obj["sessionId"].toString();
 
     if (!success) {
-        QString message = data[2].toString();
+        QString error = obj["error"].toString();
         // Handle error
     } else {
-        int bytes = data[2].toInt();
+        int bytes = obj["bytes"].toInt();
     }
-})
+});
 ```
 
-Be careful! Depending on the size of your data and the chunk size, this function could be called A LOT of times. If you are doing some QML rendering here it is going to block your UI. The advice is to update your UI (your progress bar for example) using a threshold value.
+Be careful! Depending on the size of your data and the chunk size, this function could be called A LOT of times. Progress events are throttled to at most one per percentage point to avoid flooding the caller.
 
 ##### Advanced
 
-There is an advanced API that you should use only if you cannot use the `uploadUrl`. This API allows you to upload content using a stream. Because of the constraints of Qt Remote Objects, the API cannot just accept a stream / pointer, so the API is a bit more complex but provides more control over the upload. Let's go over the steps.
+There is an advanced API that you should use only if you cannot use `uploadUrl`. This API allows you to upload content using a stream. Let's go over the steps.
 
 First you need to create an upload session by providing the filename:
 
 ```cpp
-    QString filename = "...";
-    LogosResult result = m_logos->storage_module.uploadInit(filename);
+    std::string filename = "...";
+    std::string sessionId = m_logos->storage_module.uploadInit(filename);
 
-    // Or
-    QString filename = "...";
+    // Or with custom chunk size
     int chunkSize = 1024 * 64;
-    LogosResult result = m_logos->storage_module.uploadInit(filename, chunkSize);
-
-    // Extract the session Id
-    if(result.success) {
-        QString sessionId = result.getValue<QString>();
-    }
-
+    std::string sessionId = m_logos->storage_module.uploadInit(filename, chunkSize);
 ```
 
 The filename is used to identify the metadata of your content and is useful information in the Manifest. A manifest is an object containing the information about the data identified by a CID. For more information, the dataset spec is available [here](https://lip.logos.co/storage/raw/datasets.html).
@@ -363,18 +300,17 @@ The filename is used to identify the metadata of your content and is useful info
 The result of `uploadInit` will provide you the `sessionId`. You can use this identifier to upload your chunks one by one:
 
 ```cpp
-// It is supposed that you have a valid QFile.
-QFile file;
+// Read from a file in chunks
+std::ifstream file(filePath, std::ios::binary);
+std::string chunk(chunkSize, '\0');
 
-while (!file.atEnd()) {
-    QByteArray chunk = file.read(chunkSize);
-    bytesRead += chunk.size();
-
-    result = m_logos->storage_module.uploadChunk(sessionId, chunk);
-
-    if (!result.success) {
+while (file.read(chunk.data(), chunkSize) || file.gcount() > 0) {
+    chunk.resize(static_cast<size_t>(file.gcount()));
+    bool ok = m_logos->storage_module.uploadChunk(sessionId, chunk);
+    if (!ok) {
         // Handle error here
     }
+    chunk.resize(chunkSize);
 }
 ```
 
@@ -385,13 +321,7 @@ While this requires more code, it provides more control. You can easily stop upl
 After all the chunks are sent, you need to finalize the upload to get the CID:
 
 ```cpp
-    LogosResult result = m_logos->storage_module.uploadFinalize(sessionId);
-
-    if(result.success) {
-        QString cid = result.getValue<QString>();
-    }
-
-```
+    std::string cid = m_logos->storage_module.uploadFinalize(sessionId);
 
 Then you can share this CID with others to let them be able to download the file.
 
@@ -402,65 +332,56 @@ Then you can share this CID with others to let them be able to download the file
 The easiest way to download a file is to use the `downloadToUrl` method:
 
 ```cpp
-    QString cid = "...";
-    QUrl url = ...;
+    std::string cid = "...";
+    std::string filePath = "...";
 
-    LogosResult result = m_logos->storage_module.downloadToUrl(cid, url);
+    std::string sessionId = m_logos->storage_module.downloadToUrl(cid, filePath);
 
     // Or
     bool local = false;
-    LogosResult result = m_logos->storage_module.downloadToUrl(cid, url, local);
+    std::string sessionId = m_logos->storage_module.downloadToUrl(cid, filePath, local);
 
     // Or
     int chunkSize = 1024 * 64;
-    LogosResult result = m_logos->storage_module.downloadToUrl(cid, url, local, chunkSize);
+    std::string sessionId = m_logos->storage_module.downloadToUrl(cid, filePath, local, chunkSize);
 ```
 
 If `local` is set to true, this returns data that is already local to the node; i.e., if your node already has the file, then `downloadToUrl` will read that file and copy it into the specified URL, otherwise it will fail. If `local` is set to false, instead, the node might go through the network to fetch data from other nodes if it is not locally available. If you are unsure, just set this to false.
 
 To get the download progress, subscribe to `storageDownloadProgress`. Note that you will get progress events even for locally available data.
 
-The callback gives 3 values:
-
-1. success: a bool that is true if it was successful
-2. sessionId: the sessionId of your download
-3. size: The number of bytes downloaded
-
-
 ```cpp
-m_logos->storage_module.on("storageDownloadProgress", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
-    QString sessionId = data[1].toString();
+m_logos->storage_module.on("storageDownloadProgress", [this](const QVariantList& args) {
+    // args[0] is a JSON string: {"success":true,"sessionId":"...","bytes":1024}
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    bool success = obj["success"].toBool();
+    QString sessionId = obj["sessionId"].toString();
 
     if (!success) {
-        QString message = data[2].toString();
+        QString error = obj["error"].toString();
         // Handle error
     } else {
-        int size = data[2].toInt();
-        // Show a progress download
+        int bytes = obj["bytes"].toInt();
+        // Show download progress
     }
-})
+});
 ```
 
-To get the completion event, subscribe to `storageDownloadDone`.
-
-The callback gives 3 values:
-
-1. success: a bool that is true if it was successful
-2. sessionId: the sessionId of your download
-3. message: An empty string on success
+To get the completion event, subscribe to `storageDownloadDone`:
 
 ```cpp
-m_logos->storage_module.on("storageDownloadDone", [this](const QVariantList& data) {
-    bool success = data[0].toBool();
+m_logos->storage_module.on("storageDownloadDone", [this](const QVariantList& args) {
+    // args[0] is a JSON string: {"success":true,"sessionId":"..."}
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    bool success = obj["success"].toBool();
 
     if (!success) {
-        QString message = data[1].toString();
+        QString error = obj["error"].toString();
         // Handle error
     } else {
-        // success
+        // Download complete
     }
-})
+});
 ```
 
 ##### Handle the chunks manually
@@ -468,47 +389,70 @@ m_logos->storage_module.on("storageDownloadDone", [this](const QVariantList& dat
 If you do not want to save the data to a file but you want to stream it somewhere you can use `downloadChunks`:
 
 ```cpp
-QString cid = "...";
+std::string cid = "...";
 
-LogosResult result = m_logos->storage_module.downloadChunks(cid);
+std::string sessionId = m_logos->storage_module.downloadChunks(cid);
 
 // Or
 bool local = false;
-LogosResult result = m_logos->storage_module.downloadChunks(cid, local);
+std::string sessionId = m_logos->storage_module.downloadChunks(cid, local);
 
 // Or
 int chunkSize = 1024 * 64;
-LogosResult result = m_logos->storage_module.downloadChunks(cid, local, chunkSize);
+std::string sessionId = m_logos->storage_module.downloadChunks(cid, local, chunkSize);
 ```
 
-You can subscribe to the same events: `storageDownloadProgress` and `storageDownloadDone`. But there is an important difference. For `storageDownloadProgress`, the callback values are:
+You can subscribe to the same events: `storageDownloadProgress` and `storageDownloadDone`. But there is an important difference. For `storageDownloadProgress` in chunk mode, the payload contains a `chunk` field instead of `bytes`:
 
-1. success: a bool that is true if it was successful
-2. sessionId: the sessionId of your download
-3. chunk: The chunk of data downloaded
+```cpp
+m_logos->storage_module.on("storageDownloadProgress", [this](const QVariantList& args) {
+    QJsonObject obj = QJsonDocument::fromJson(args[0].toString().toUtf8()).object();
+    // In chunk mode, "chunk" contains the raw downloaded data
+    std::string chunk = obj["chunk"].toString().toStdString();
+    // Process the chunk
+});
+```
 
-**Important note**: Because of Qt Remote Objects constraints, the chunk is COPIED when passed to the callback. If performance is crucial (working with big files) prefer the `downloadToUrl` method.
+**Important note**: The chunk is copied when passed to the callback. If performance is crucial (working with big files) prefer the `downloadToUrl` method.
 
 #### Data management
 
 Several methods are available to manage the data in your node.
 
-- `exists`: Verify that a manifest exists for the CID in your local store.
-- `fetch`: Download a file in the background to your store (you won't receive any event).
+- `exists`: Returns `true` if a manifest exists for the CID in your local store.
+- `fetch`: Download a file in the background to your store (no event emitted).
 - `remove`: Remove a file from your local storage.
-- `space`: Gets the maximum amount of disk space your node is allowed to occupy.
-- `manifests`: Get the manifests of the files in your local node.
-- `downloadManifest`: Download a manifest to get information about a CID.
+- `space`: Returns a `LogosMap` with disk quota information (`totalBlocks`, `quotaMaxBytes`, `quotaUsedBytes`, `quotaReservedBytes`).
+- `manifests`: Returns a `LogosList` with all manifests stored locally (each entry has `cid`, `treeCid`, `datasetSize`, `blockSize`, `filename`, `mimetype`).
+- `downloadManifest`: Returns a `LogosMap` with the manifest for a given CID.
 
 #### Debug / info
 
 Several methods are available for debugging your Logos Storage:
 
 - `dataDir`: Get the folder that contains the Logos Storage data.
-- `debug`: Get debug information such as peers, SPR, etc.
+- `debug`: Get a `LogosMap` with debug information (id, addrs, announceAddresses, table).
 - `spr`: Get the SPR of your node.
 - `peerId`: Get the peer ID of your node.
 - `updateLogLevel`: Change the log level of Logos Storage node.
+
+## Module Structure
+
+```
+src/
+  storage_module_plugin.h   # Plain C++ class (`StorageModuleImpl`) — the public API surface
+  storage_module_plugin.cpp # Implementation using libstorage C bindings
+tests/
+  test_storage.cpp          # Unit tests (mocked libstorage)
+  test_storage_module.cpp   # Integration tests (real libstorage)
+  mocks/mock_libstorage.cpp # Mock for unit tests
+  stubs/libstorage.h        # Stub header for test compilation
+metadata.json               # Module config (name, version, interface=universal, deps)
+flake.nix                   # Nix build
+CMakeLists.txt              # CMake (generated_code/ picked up automatically)
+```
+
+The `generated_code/` directory is produced at build time by `logos-cpp-generator` and is not committed to git.
 
 ## Tests
 
@@ -531,8 +475,7 @@ nix run .#tests -- test_peerId
 - pkg-config
 
 #### Dependencies
-- Qt6 (qtbase)
-- Qt6 Remote Objects (qtremoteobjects)
+- logos-module-builder (build system + code generator)
 - logos-liblogos
-- logos-cpp-sdk (for header generation)
+- nlohmann_json
 - [libstorage](https://github.com/logos-storage/logos-storage-nim/tree/chore/improve-c-bindings/library)

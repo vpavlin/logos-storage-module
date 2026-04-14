@@ -1,150 +1,167 @@
 #pragma once
 
-#include "libstorage.h"
-#include "logos_api.h"
-#include "logos_api_client.h"
-#include "storage_module_interface.h"
-#include <QCoreApplication>
-#include <QMutex>
-#include <QWaitCondition>
-#include <QtCore/QObject>
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <logos_json.h>
 
-// Signals for synchronous behaviour
-enum class StorageSignal {
-    Init,
-    Close,
-    Start,
-    Stop,
-    Version,
-    DataDir,
-    PeerId,
-    Spr,
-    Debug,
-    LogLevel,
-    UploadInit,
-    UploadCancel,
-    UploadFinalize,
-    UploadDone,
-    Exists,
-    Fetch,
-    Remove,
-    DownloadInit,
-    DownloadProgress,
-    DownloadCancel,
-    DownloadDone,
-    Space,
-    Manifests,
-    DownloadManifest
-
-};
-
-// Event for asynchronous event
-enum class StorageEvent { Start, Stop, Connect, UploadProgress, UploadDone, DownloadProgress, DownloadDone };
-
-// Keep the event names in a single place to avoid mistakes
-// and make it easier to change in the future if needed.
-inline QString eventName(StorageEvent event) {
-    switch (event) {
-    case StorageEvent::Start:
-        return "storageStart";
-    case StorageEvent::Stop:
-        return "storageStop";
-    case StorageEvent::Connect:
-        return "storageConnect";
-    case StorageEvent::UploadProgress:
-        return "storageUploadProgress";
-    case StorageEvent::UploadDone:
-        return "storageUploadDone";
-    case StorageEvent::DownloadProgress:
-        return "storageDownloadProgress";
-    case StorageEvent::DownloadDone:
-        return "storageDownloadDone";
-    }
-    return "";
+extern "C" {
+#include "lib/libstorage.h"
 }
 
-// After this time, the sync method will timeout,
-// and return an error.
-// This is to prevent the UI from hanging indefinitely
-// in case of an issue with the storage module.
-static const int DEFAULT_SYNC_TIMEOUT = 1000;
+class StorageModuleImpl {
+public:
+    StorageModuleImpl();
+    ~StorageModuleImpl();
 
-// Define a type for storage functions that take no arguments.
-using StorageNoArgFunction = int (*)(void*, StorageCallback, void*);
-// Define a type for storage functions that take one string argument.
-using StorageStringArgFunction = int (*)(void*, const char*, StorageCallback, void*);
-// Define a type for storage functions that take a string argument and a int argument.
-using StorageStringArgAndIntArgFunction = int (*)(void*, const char*, const size_t, StorageCallback, void*);
+    // Wired automatically by the generated glue layer.
+    // Call this to emit named events to other modules / the host application.
+    // Data is a JSON-encoded string (object or array).
+    std::function<void(const std::string& eventName, const std::string& data)> emitEvent;
 
-class StorageModulePlugin : public QObject, public StorageModuleInterface {
-    Q_OBJECT
-    Q_PLUGIN_METADATA(IID StorageModuleInterface_iid FILE "metadata.json")
-    Q_INTERFACES(StorageModuleInterface PluginInterface)
+    // Initialize the storage node with a JSON config string.
+    //
+    // Example config keys: data-dir, log-level, log-file, listen-addrs, bootstrap-node, ...
+    // Returns true on success.
+    // The method is synchronous.
+    bool init(const std::string& cfg);
 
-  public:
-    StorageModulePlugin();
-    ~StorageModulePlugin();
+    // Start the storage node.
+    // The method is asynchronous; emits "storageStart" event on completion.
+    // Returns true if the start command was accepted.
+    bool start();
 
-    Q_INVOKABLE bool init(const QString& cfg) override;
-    Q_INVOKABLE bool start() override;
-    Q_INVOKABLE LogosResult version() override;
-    Q_INVOKABLE LogosResult dataDir() override;
-    Q_INVOKABLE LogosResult peerId() override;
-    Q_INVOKABLE LogosResult debug() override;
-    Q_INVOKABLE LogosResult spr() override;
-    Q_INVOKABLE LogosResult updateLogLevel(const QString& logLevel) override;
-    Q_INVOKABLE LogosResult connect(const QString& peerId, const QStringList& peerAddresses) override;
-    Q_INVOKABLE LogosResult uploadUrl(const QUrl& url, const int chunkSize = 1024 * 64) override;
-    Q_INVOKABLE LogosResult uploadInit(const QString& filename, const int chunkSize = 1024 * 64) override;
-    Q_INVOKABLE LogosResult uploadChunk(const QString& sessionId, const QByteArray& chunk) override;
-    Q_INVOKABLE LogosResult uploadFinalize(const QString& sessionId) override;
-    Q_INVOKABLE LogosResult uploadCancel(const QString& sessionId) override;
-    Q_INVOKABLE LogosResult downloadCancel(const QString& sessionId) override;
-    Q_INVOKABLE LogosResult downloadToUrl(const QString& cid, const QUrl& url, const bool local = false,
-                                          const int chunkSize = 1024 * 64) override;
-    Q_INVOKABLE LogosResult downloadChunks(const QString& cid, const bool local = false,
-                                           const int chunkSize = 1024 * 64, const QString& filepath = "") override;
-    Q_INVOKABLE LogosResult exists(const QString& cid) override;
-    Q_INVOKABLE LogosResult fetch(const QString& cid) override;
-    Q_INVOKABLE LogosResult remove(const QString& cid) override;
-    Q_INVOKABLE LogosResult space() override;
-    Q_INVOKABLE LogosResult manifests() override;
-    Q_INVOKABLE LogosResult downloadManifest(const QString& cid) override;
-    Q_INVOKABLE LogosResult stop() override;
-    Q_INVOKABLE LogosResult destroy() override;
-    Q_INVOKABLE void importFiles(const QString& path);
+    // Stop the storage node.
+    // The method is asynchronous; emits "storageStop" event on completion.
+    // Returns true if the stop command was accepted.
+    bool stop();
 
-    QString name() const override { return "storage_module"; }
-    QString version() const override { return "1.0.0"; }
+    // Destroy the storage context and free all resources.
+    // The node must be stopped before calling this.
+    // The method is synchronous.
+    bool destroy();
 
-    // LogosAPI initialization
-    Q_INVOKABLE void initLogos(LogosAPI* logosAPIInstance);
+    // Get the libstorage version string (does not require a started node).
+    // The method is synchronous.
+    std::string version();
 
-  signals:
-    // for now this is required for events, later it might not be necessary if using a proxy
-    void eventResponse(const QString& eventName, const QVariantList& data);
+    // Get the storage data directory.
+    // The method is synchronous.
+    std::string dataDir();
 
-    // This signal is used when we need a synchronous response.
-    // The operation will allow to distinguish which function the response is for.
-    void storageResponse(const StorageSignal& signal, int code, const QString& message);
+    // Get the node peer ID.
+    // The method is synchronous.
+    std::string peerId();
 
-  private:
+    // Get the node's Signed Peer Record (SPR).
+    // The method is synchronous.
+    std::string spr();
+
+    // Get debug info: id, addrs, announceAddresses, table.
+    // Returns a LogosMap with the parsed JSON fields.
+    // The method is synchronous.
+    LogosMap debug();
+
+    // Set the runtime log level (TRACE, DEBUG, INFO, NOTICE, WARN, ERROR, FATAL).
+    // Returns true on success.
+    // The method is synchronous.
+    bool updateLogLevel(const std::string& logLevel);
+
+    // Connect to a peer by peer ID, optionally using explicit addresses.
+    // The method is asynchronous; emits "storageConnect" event on completion.
+    // Returns true if the connect command was accepted.
+    bool connect(const std::string& peerId, const std::vector<std::string>& peerAddresses);
+
+    // Upload a local file by path.
+    // chunkSize controls the upload chunk size in bytes.
+    // Returns the upload session ID on success, empty string on error.
+    // The method is asynchronous; emits "storageUploadProgress" and "storageUploadDone".
+    std::string uploadUrl(const std::string& filePath, int64_t chunkSize);
+
+    // Create an upload session for manual chunk-by-chunk upload.
+    // Returns the session ID on success, empty string on error.
+    // The method is synchronous.
+    std::string uploadInit(const std::string& filename, int64_t chunkSize);
+
+    // Upload a single chunk for a session created with uploadInit.
+    // Returns true on success.
+    // Emits "storageUploadProgress".
+    bool uploadChunk(const std::string& sessionId, const std::string& chunk);
+
+    // Finalize a manual upload session and retrieve the CID.
+    // Returns the CID on success, empty string on error.
+    // The method is synchronous.
+    std::string uploadFinalize(const std::string& sessionId);
+
+    // Cancel an ongoing upload session.
+    // Returns true on success.
+    // The method is synchronous.
+    bool uploadCancel(const std::string& sessionId);
+
+    // Download content by CID to a local file path.
+    // If local=true, only uses locally cached data (no network fetch).
+    // Returns the download session ID (= CID) on success, empty string on error.
+    // The method is asynchronous; emits "storageDownloadProgress" and "storageDownloadDone".
+    std::string downloadToUrl(const std::string& cid, const std::string& filePath,
+                              bool local, int64_t chunkSize);
+
+    // Download content by CID as a chunk stream.
+    // Chunks are delivered via "storageDownloadProgress" events (chunk field in JSON).
+    // Returns the download session ID (= CID) on success, empty string on error.
+    // The method is asynchronous; emits "storageDownloadProgress" and "storageDownloadDone".
+    std::string downloadChunks(const std::string& cid, bool local,
+                               int64_t chunkSize);
+
+    // Cancel an ongoing download session.
+    // Returns true on success.
+    // The method is synchronous.
+    bool downloadCancel(const std::string& sessionId);
+
+    // Check whether content identified by CID exists in local storage.
+    // The method is synchronous.
+    bool exists(const std::string& cid);
+
+    // Fetch content from the network and store it locally in the background.
+    // Returns true if the fetch request was accepted.
+    // The method is synchronous (accepts the request, download is async).
+    bool fetch(const std::string& cid);
+
+    // Remove content identified by CID from local storage.
+    // Returns true on success.
+    // The method is synchronous.
+    bool remove(const std::string& cid);
+
+    // Get storage space information.
+    // Returns a LogosMap with: totalBlocks, quotaMaxBytes, quotaUsedBytes, quotaReservedBytes.
+    // The method is synchronous.
+    LogosMap space();
+
+    // List all manifests stored locally.
+    // Each item has: cid, treeCid, datasetSize, blockSize, filename, mimetype.
+    // The method is synchronous.
+    LogosList manifests();
+
+    // Download and return the manifest for a given CID.
+    // Returns a LogosMap with: cid, treeCid, datasetSize, blockSize, filename, mimetype.
+    // The method is synchronous.
+    LogosMap downloadManifest(const std::string& cid);
+
+    // Import all files from a directory (headless helper).
+    // Uploads each regular file found; does not wait for uploads to complete.
+    void importFiles(const std::string& path);
+
+    void emitEventSafe(const std::string& name, const std::string& data) const;
+
+private:
     void* storageCtx;
-    bool isStarted = false;
+    bool isStarted;
 
-    // Helper to simulate synchronous calls.
-    // It waits for the signal to be emitted with the matching StorageSignal value,
-    // and returns the result.
-    // If the signal is not received within the timeout, it returns an error.
-    LogosResult waitForSignal(const StorageSignal& signal, int timeout);
-
-    // Generic helper that handles all sync call types with optional arguments.
-    LogosResult syncCall(StorageSignal signal, StorageNoArgFunction fn, int timeout = DEFAULT_SYNC_TIMEOUT);
-    LogosResult syncCall(StorageSignal signal, StorageStringArgFunction fn, const QString& arg,
-                         int timeout = DEFAULT_SYNC_TIMEOUT);
-    LogosResult syncCall(StorageSignal signal, StorageStringArgAndIntArgFunction fn, const QString& arg1, int arg2,
-                         int timeout = DEFAULT_SYNC_TIMEOUT);
-
-    // Callback used by libstorage to pass the data back to the Storage Module.
-    static void callback(int callerRet, const char* msg, size_t len, void* userData);
+    // Shared internal download helper used by downloadToUrl and downloadChunks.
+    std::string downloadChunksInternal(const std::string& cid,
+                                       const std::string& filepath,
+                                       bool local, int64_t chunkSize);
 };

@@ -3,10 +3,6 @@ project(StorageModuleTests LANGUAGES CXX)
 
 include(LogosTest)
 
-# Copy metadata.json so AUTOMOC can find it for Q_PLUGIN_METADATA
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/../metadata.json
-               ${CMAKE_CURRENT_BINARY_DIR}/metadata.json COPYONLY)
-
 # ── Unit tests (mocked libstorage) ──────────────────────────────────────────
 
 logos_test(

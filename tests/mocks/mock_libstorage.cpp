@@ -1,8 +1,9 @@
 // Mock implementation of libstorage C functions.
 // Replaces the real Nim library at link time during unit tests.
 //
-// Async functions invoke the callback immediately so that the Qt event loop
-// can deliver them when waitForSignal() runs loop.exec().
+// All functions invoke the callback immediately (synchronously) so that
+// syncDispatch can signal the condvar before waitSync starts waiting,
+// and asyncDispatch can dispatch events without needing a separate thread.
 // Return values and callback messages are controlled via LogosCMockStore:
 //   t.mockCFunction("storage_peer_id").returns("QmTestPeerId");
 
@@ -145,20 +146,19 @@ int storage_download_cancel(void* ctx, const char* cid, StorageCallback cb, void
 
 // ── String+size_t async functions (StorageStringArgAndIntArgFunction) ───────
 
-int storage_fetch(void* ctx, const char* cid, size_t timeout, StorageCallback cb, void* userData) {
+int storage_fetch(void* ctx, const char* cid, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_fetch");
     invokeOk("storage_fetch", cb, userData);
     return RET_OK;
 }
 
-int storage_delete(void* ctx, const char* cid, size_t timeout, StorageCallback cb, void* userData) {
+int storage_delete(void* ctx, const char* cid, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_delete");
     invokeOk("storage_delete", cb, userData);
     return RET_OK;
 }
 
-int storage_download_manifest(void* ctx, const char* cid, size_t timeout,
-                              StorageCallback cb, void* userData) {
+int storage_download_manifest(void* ctx, const char* cid, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_download_manifest");
     invokeOk("storage_download_manifest", cb, userData);
     return RET_OK;

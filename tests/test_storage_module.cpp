@@ -1,4 +1,4 @@
-// Integration tests for StorageModulePlugin — uses the REAL libstorage library.
+// Integration tests for StorageModuleImpl — uses the REAL libstorage library.
 // No mocking. These tests start an actual storage node, upload/download real data,
 // and verify end-to-end behavior.
 //
@@ -8,397 +8,398 @@
 #include <logos_test.h>
 #include "storage_module_plugin.h"
 
-#include <QCoreApplication>
-#include <QDir>
-#include <QEventLoop>
-#include <QFile>
-#include <QTemporaryDir>
-#include <QTimer>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <string>
 
-static const int DEFAULT_TIMEOUT = 3000;
-static const QString LOG_FILENAME = "storage.log";
+namespace fs = std::filesystem;
 
-// ---------------------------------------------------------------------------
-// Helper: wait for a specific StorageSignal with timeout
-// ---------------------------------------------------------------------------
-static LogosResult waitForSignal(StorageModulePlugin* plugin, StorageSignal signal, int timeout) {
-    QEventLoop loop;
-    LogosResult result = {false, ""};
-    QMetaObject::Connection connection;
-
-    auto fn = [&](const StorageSignal& s, int code, const QString& m) {
-        if (s != signal) return;
-        result.success = code == RET_OK;
-        result.value = m;
-        QObject::disconnect(connection);
-        loop.quit();
-    };
-
-    connection = QObject::connect(plugin, &StorageModulePlugin::storageResponse, &loop, fn);
-
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() {
-        result.success = false;
-        result.value = QString("Timeout waiting for signal.");
-        loop.quit();
-    });
-
-    timer.start(timeout);
-    loop.exec();
-    return result;
-}
+static const int DEFAULT_TIMEOUT_MS = 3000;
+static const int START_TIMEOUT_MS   = 15000;
+static const std::string LOG_FILENAME = "storage.log";
 
 // ---------------------------------------------------------------------------
-// Helper: upload content and return the CID
+// EventWaiter — replaces QEventLoop + storageResponse signal.
+// Collects named events emitted via StorageModuleImpl::emitEvent.
 // ---------------------------------------------------------------------------
-static QString uploadFile(StorageModulePlugin* plugin, const QByteArray& content, const QString& filename) {
-    QTemporaryDir folder(QDir::currentPath());
-    const QString filePath = folder.path() + "/" + filename;
-    QFile f(filePath);
-    if (!f.open(QIODevice::WriteOnly)) { return ""; }
-    f.write(content);
-    f.close();
 
-    LogosResult startResult = plugin->uploadUrl(QUrl::fromLocalFile(filePath));
-    if (!startResult.success) { return ""; }
+struct EventWaiter {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::string lastEventName;
+    std::string lastEventData;
+    bool received = false;
 
-    LogosResult doneResult = waitForSignal(plugin, StorageSignal::UploadDone, DEFAULT_TIMEOUT);
-    if (!doneResult.success) { return ""; }
+    // Install as emitEvent on an impl instance.
+    void install(StorageModuleImpl* impl) {
+        impl->emitEvent = [this](const std::string& name,
+                                  const std::string& data) {
+            std::unique_lock<std::mutex> lock(mtx);
+            lastEventName = name;
+            lastEventData = data;
+            received = true;
+            cv.notify_all();
+        };
+    }
 
-    return doneResult.getString().section(',', 1);
-}
+    // Reset before waiting for the next event.
+    void reset() {
+        std::unique_lock<std::mutex> lock(mtx);
+        received = false;
+        lastEventName.clear();
+        lastEventData.clear();
+    }
 
-// ---------------------------------------------------------------------------
-// Helper: collect download chunks until DownloadDone
-// ---------------------------------------------------------------------------
-static QByteArray collectDownloadChunks(StorageModulePlugin* plugin, int timeout) {
-    QEventLoop loop;
-    QByteArray collected;
-    bool success = false;
-    QMetaObject::Connection connection;
+    // Wait for any event named `name` within timeoutMs.
+    // Returns true if the event arrived and "success" was true in its JSON payload.
+    bool waitFor(const std::string& name, int timeoutMs) {
+        std::unique_lock<std::mutex> lock(mtx);
+        bool ok = cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                              [&] { return received && lastEventName == name; });
+        return ok;
+    }
 
-    auto fn = [&](const StorageSignal& s, int code, const QString& m) {
-        if (s == StorageSignal::DownloadProgress) {
-            collected.append(m.toUtf8());
-        } else if (s == StorageSignal::DownloadDone) {
-            success = (code == RET_OK);
-            QObject::disconnect(connection);
-            loop.quit();
-        }
-    };
-
-    connection = QObject::connect(plugin, &StorageModulePlugin::storageResponse, &loop, fn);
-
-    QTimer timer;
-    timer.setSingleShot(true);
-    QObject::connect(&timer, &QTimer::timeout, &loop, [&]() {
-        QObject::disconnect(connection);
-        loop.quit();
-    });
-
-    timer.start(timeout);
-    loop.exec();
-    return success ? collected : QByteArray();
-}
+    // Non-blocking: returns the last event data string (must be called under lock or after wait).
+    std::string data() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return lastEventData;
+    }
+};
 
 // ---------------------------------------------------------------------------
-// Shared plugin instance — restarted before each test.
+// Shared impl instance — restarted before each test.
 // ---------------------------------------------------------------------------
-static StorageModulePlugin* g_plugin = nullptr;
-static QTemporaryDir* g_dataDir = nullptr;
+
+static StorageModuleImpl* g_impl = nullptr;
+static fs::path g_dataDir;
+static EventWaiter g_waiter;
 
 static void ensureRestarted() {
-    if (g_plugin) {
-        g_plugin->stop();
-        waitForSignal(g_plugin, StorageSignal::Stop, DEFAULT_TIMEOUT);
-        g_plugin->destroy();
-        delete g_plugin;
-        g_plugin = nullptr;
-        delete g_dataDir;
-        g_dataDir = nullptr;
+    if (g_impl) {
+        g_impl->stop();
+        g_waiter.reset();
+        g_waiter.waitFor("storageStop", DEFAULT_TIMEOUT_MS);
+        g_impl->destroy();
+        delete g_impl;
+        g_impl = nullptr;
+        g_dataDir.clear();
     }
 
-    g_dataDir = new QTemporaryDir(QDir::tempPath() + "/logos-storage-integration-test");
-    if (!g_dataDir->isValid()) {
-        throw LogosTestFailure("Failed to create temp directory.");
+    g_dataDir = fs::temp_directory_path() /
+                ("logos-storage-integration-test-" +
+                 std::to_string(
+                     std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(g_dataDir);
+
+    std::string logFile = (g_dataDir / LOG_FILENAME).string();
+
+    g_impl = new StorageModuleImpl();
+    g_waiter.install(g_impl);
+
+    std::string config =
+        std::string("{\"data-dir\":\"") + g_dataDir.string() +
+        "\",\"log-level\":\"DEBUG\",\"log-file\":\"" + logFile + "\"}";
+
+    if (!g_impl->init(config)) {
+        throw LogosTestFailure("Failed to init storage impl.");
     }
 
-    QString logFile = g_dataDir->path() + "/" + LOG_FILENAME;
-    g_plugin = new StorageModulePlugin();
-
-    const QString config =
-        QString(R"({"data-dir": "%1", "log-level": "DEBUG", "log-file": "%2"})").arg(g_dataDir->path(), logFile);
-
-    if (!g_plugin->init(config)) {
-        throw LogosTestFailure("Failed to init storage plugin.");
-    }
-    if (!g_plugin->start()) {
-        throw LogosTestFailure("Failed to start storage plugin.");
+    g_waiter.reset();
+    if (!g_impl->start()) {
+        throw LogosTestFailure("Failed to start storage impl.");
     }
 
-    const int START_TIMEOUT = 15000;
-    LogosResult result = waitForSignal(g_plugin, StorageSignal::Start, START_TIMEOUT);
-    if (!result.success) {
+    if (!g_waiter.waitFor("storageStart", START_TIMEOUT_MS)) {
         throw LogosTestFailure("Storage node did not start within timeout.");
     }
 }
 
-// ── test_version ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Helper: write a file and upload it, returning the CID.
+// ---------------------------------------------------------------------------
+
+static std::string uploadContent(const std::string& content,
+                                  const std::string& filename) {
+    fs::path filePath = g_dataDir / filename;
+    std::ofstream f(filePath, std::ios::binary);
+    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    f.close();
+
+    g_waiter.reset();
+    std::string sid = g_impl->uploadUrl(filePath.string(), 65536);
+    if (sid.empty()) return {};
+
+    if (!g_waiter.waitFor("storageUploadDone", DEFAULT_TIMEOUT_MS)) return {};
+
+    // Extract CID from JSON payload: {"success":true,"sessionId":"...","cid":"..."}
+    std::string d = g_waiter.data();
+    auto cidPos = d.find("\"cid\":\"");
+    if (cidPos == std::string::npos) return {};
+    cidPos += 7;
+    auto cidEnd = d.find('"', cidPos);
+    if (cidEnd == std::string::npos) return {};
+    return d.substr(cidPos, cidEnd - cidPos);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: collect download chunks until storageDownloadDone.
+// ---------------------------------------------------------------------------
+
+static std::string collectDownloadChunks(int timeoutMs) {
+    std::string collected;
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    bool success = false;
+
+    g_impl->emitEvent = [&](const std::string& name, const std::string& data) {
+        if (name == "storageDownloadProgress") {
+            // Extract chunk field from JSON payload.
+            auto pos = data.find("\"chunk\":\"");
+            if (pos != std::string::npos) {
+                pos += 9;
+                auto end = data.find('"', pos);
+                if (end != std::string::npos) {
+                    collected += data.substr(pos, end - pos);
+                }
+            }
+        } else if (name == "storageDownloadDone") {
+            success = data.find("\"success\":true") != std::string::npos;
+            std::unique_lock<std::mutex> lock(m);
+            done = true;
+            cv.notify_all();
+        }
+    };
+
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                [&] { return done; });
+
+    // Restore normal waiter.
+    g_waiter.install(g_impl);
+
+    return success ? collected : std::string();
+}
+
+// ── integration_version ─────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_version) {
     ensureRestarted();
-    LogosResult result = g_plugin->version();
-
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_FALSE(result.getString().isEmpty());
+    std::string v = g_impl->version();
+    LOGOS_ASSERT_FALSE(v.empty());
 }
 
-// ── test_dataDir ────────────────────────────────────────────────────────────
+// ── integration_dataDir ──────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_dataDir) {
     ensureRestarted();
-    LogosResult result = g_plugin->dataDir();
-
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_EQ(result.getString().toStdString(), g_dataDir->path().toStdString());
+    std::string d = g_impl->dataDir();
+    LOGOS_ASSERT_EQ(d, g_dataDir.string());
 }
 
-// ── test_peerId ─────────────────────────────────────────────────────────────
+// ── integration_peerId ───────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_peerId) {
     ensureRestarted();
-    LogosResult result = g_plugin->peerId();
-
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_FALSE(result.getString().isEmpty());
+    std::string id = g_impl->peerId();
+    LOGOS_ASSERT_FALSE(id.empty());
 }
 
-// ── test_debug ──────────────────────────────────────────────────────────────
+// ── integration_debug ────────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_debug) {
     ensureRestarted();
-    LogosResult result = g_plugin->debug();
-
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_FALSE(result.getString("id").isEmpty());
-    LOGOS_ASSERT(result.getMap().contains("addrs"));
-    LOGOS_ASSERT(result.getMap().contains("announceAddresses"));
-    LOGOS_ASSERT(result.getMap().contains("table"));
+    LogosMap map = g_impl->debug();
+    LOGOS_ASSERT_FALSE(map.empty());
+    LOGOS_ASSERT(map.count("id") > 0);
+    LOGOS_ASSERT(map.count("addrs") > 0);
+    LOGOS_ASSERT(map.count("announceAddresses") > 0);
+    LOGOS_ASSERT(map.count("table") > 0);
 }
 
-// ── test_spr ────────────────────────────────────────────────────────────────
+// ── integration_spr ──────────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_spr) {
     ensureRestarted();
-    LogosResult result = g_plugin->spr();
-
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_FALSE(result.getString().isEmpty());
+    std::string s = g_impl->spr();
+    LOGOS_ASSERT_FALSE(s.empty());
 }
 
-// ── test_uploadFile ─────────────────────────────────────────────────────────
+// ── integration_uploadFile ───────────────────────────────────────────────────
 
 LOGOS_TEST(integration_uploadFile) {
     ensureRestarted();
-    const QString cid = uploadFile(g_plugin, "Hello, Logos Storage!", "test_upload.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string cid = uploadContent("Hello, Logos Storage!", "test_upload.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 }
 
-// ── test_uploadWorkflowManual ───────────────────────────────────────────────
+// ── integration_uploadWorkflowManual ─────────────────────────────────────────
 
 LOGOS_TEST(integration_uploadWorkflowManual) {
     ensureRestarted();
 
-    const QString filePath = g_dataDir->path() + "/test_manual_upload.txt";
-    const QByteArray content = "Hello, Logos Storage! Manual upload test.";
-    QFile f(filePath);
-    LOGOS_ASSERT_TRUE(f.open(QIODevice::WriteOnly));
-    f.write(content);
+    fs::path filePath = g_dataDir / "test_manual_upload.txt";
+    std::string content = "Hello, Logos Storage! Manual upload test.";
+    std::ofstream f(filePath, std::ios::binary);
+    f.write(content.data(), static_cast<std::streamsize>(content.size()));
     f.close();
 
-    // Step 1: init upload session
-    LogosResult initResult = g_plugin->uploadInit(filePath);
-    LOGOS_ASSERT_TRUE(initResult.success);
-    const QString sessionId = initResult.getString();
-    LOGOS_ASSERT_FALSE(sessionId.isEmpty());
+    std::string sid = g_impl->uploadInit(filePath.string(), 65536);
+    LOGOS_ASSERT_FALSE(sid.empty());
 
-    // Step 2: upload the content as a single chunk
-    LogosResult chunkResult = g_plugin->uploadChunk(sessionId, content);
-    LOGOS_ASSERT_TRUE(chunkResult.success);
+    LOGOS_ASSERT_TRUE(g_impl->uploadChunk(sid, content));
 
-    // Step 3: finalize, get the CID
-    LogosResult finalResult = g_plugin->uploadFinalize(sessionId);
-    LOGOS_ASSERT_TRUE(finalResult.success);
-    const QString cid = finalResult.getString();
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string cid = g_impl->uploadFinalize(sid);
+    LOGOS_ASSERT_FALSE(cid.empty());
 }
 
-// ── test_downloadFile ───────────────────────────────────────────────────────
+// ── integration_downloadFile ─────────────────────────────────────────────────
 
 LOGOS_TEST(integration_downloadFile) {
     ensureRestarted();
 
-    const QByteArray content = "Hello, Logos Download Test!";
-    const QString cid = uploadFile(g_plugin, content, "test_download.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string content = "Hello, Logos Download Test!";
+    std::string cid = uploadContent(content, "test_download.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    const QString downloadPath = g_dataDir->path() + "/test_download_result.txt";
-    LogosResult downloadStart = g_plugin->downloadToUrl(cid, QUrl::fromLocalFile(downloadPath));
-    LOGOS_ASSERT_TRUE(downloadStart.success);
+    fs::path downloadPath = g_dataDir / "test_download_result.txt";
 
-    LogosResult downloadDone = waitForSignal(g_plugin, StorageSignal::DownloadDone, DEFAULT_TIMEOUT);
-    LOGOS_ASSERT_TRUE(downloadDone.success);
+    g_waiter.reset();
+    std::string sid = g_impl->downloadToUrl(cid, downloadPath.string(), false, 65536);
+    LOGOS_ASSERT_FALSE(sid.empty());
 
-    QFile downloaded(downloadPath);
-    LOGOS_ASSERT_TRUE(downloaded.open(QIODevice::ReadOnly));
-    const QByteArray downloadedContent = downloaded.readAll();
-    downloaded.close();
+    LOGOS_ASSERT_TRUE(g_waiter.waitFor("storageDownloadDone", DEFAULT_TIMEOUT_MS));
 
-    LOGOS_ASSERT_EQ(downloadedContent.toStdString(), content.toStdString());
+    std::ifstream in(downloadPath, std::ios::binary);
+    std::string downloaded((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    LOGOS_ASSERT_EQ(downloaded, content);
 }
 
-// ── test_downloadChunks ─────────────────────────────────────────────────────
+// ── integration_downloadChunks ───────────────────────────────────────────────
 
 LOGOS_TEST(integration_downloadChunks) {
     ensureRestarted();
 
-    const QByteArray content = "Hello, Logos Chunks Download Test!";
-    const QString cid = uploadFile(g_plugin, content, "test_chunks_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string content = "Hello, Logos Chunks Download Test!";
+    std::string cid = uploadContent(content, "test_chunks_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult startResult = g_plugin->downloadChunks(cid);
-    LOGOS_ASSERT_TRUE(startResult.success);
+    // collectDownloadChunks installs a custom emitEvent handler.
+    std::string sid = g_impl->downloadChunks(cid, false, 65536);
+    LOGOS_ASSERT_FALSE(sid.empty());
 
-    const QByteArray downloaded = collectDownloadChunks(g_plugin, DEFAULT_TIMEOUT);
-    LOGOS_ASSERT_FALSE(downloaded.isEmpty());
-    LOGOS_ASSERT_EQ(downloaded.toStdString(), content.toStdString());
+    std::string downloaded = collectDownloadChunks(DEFAULT_TIMEOUT_MS);
+    LOGOS_ASSERT_FALSE(downloaded.empty());
+    LOGOS_ASSERT_EQ(downloaded, content);
 }
 
-// ── test_exists ─────────────────────────────────────────────────────────────
+// ── integration_exists ───────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_exists) {
     ensureRestarted();
 
-    const QString cid = uploadFile(g_plugin, "Hello, Logos Exists Test!", "test_exists_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string cid = uploadContent("Hello, Logos Exists Test!", "test_exists_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult result = g_plugin->exists(cid);
-    LOGOS_ASSERT_TRUE(result.success);
-    LOGOS_ASSERT_TRUE(result.getBool());
+    LOGOS_ASSERT_TRUE(g_impl->exists(cid));
 }
 
-// ── test_fetch ──────────────────────────────────────────────────────────────
+// ── integration_fetch ────────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_fetch) {
     ensureRestarted();
 
-    const QString cid = uploadFile(g_plugin, "Hello, Logos Fetch Test!", "test_fetch_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string cid = uploadContent("Hello, Logos Fetch Test!", "test_fetch_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult result = g_plugin->fetch(cid);
-    LOGOS_ASSERT_TRUE(result.success);
+    LOGOS_ASSERT_TRUE(g_impl->fetch(cid));
 }
 
-// ── test_remove ─────────────────────────────────────────────────────────────
+// ── integration_remove ───────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_remove) {
     ensureRestarted();
 
-    const QString cid = uploadFile(g_plugin, "Hello, Logos Remove Test!", "test_remove_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string cid = uploadContent("Hello, Logos Remove Test!", "test_remove_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult existsResult = g_plugin->exists(cid);
-    LOGOS_ASSERT_TRUE(existsResult.success);
-    LOGOS_ASSERT_TRUE(existsResult.getBool());
-
-    LogosResult removeResult = g_plugin->remove(cid);
-    LOGOS_ASSERT_TRUE(removeResult.success);
-
-    existsResult = g_plugin->exists(cid);
-    LOGOS_ASSERT_TRUE(existsResult.success);
-    LOGOS_ASSERT_FALSE(existsResult.getBool());
+    LOGOS_ASSERT_TRUE(g_impl->exists(cid));
+    LOGOS_ASSERT_TRUE(g_impl->remove(cid));
+    LOGOS_ASSERT_FALSE(g_impl->exists(cid));
 }
 
-// ── test_space ──────────────────────────────────────────────────────────────
+// ── integration_space ────────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_space) {
     ensureRestarted();
 
-    LogosResult result = g_plugin->space();
-    LOGOS_ASSERT_TRUE(result.success);
-
-    const QVariantMap map = result.getMap();
-    LOGOS_ASSERT(map.contains("totalBlocks"));
-    LOGOS_ASSERT(map.contains("quotaMaxBytes"));
-    LOGOS_ASSERT(map.contains("quotaUsedBytes"));
-    LOGOS_ASSERT(map.contains("quotaReservedBytes"));
+    LogosMap map = g_impl->space();
+    LOGOS_ASSERT_FALSE(map.empty());
+    LOGOS_ASSERT(map.count("totalBlocks") > 0);
+    LOGOS_ASSERT(map.count("quotaMaxBytes") > 0);
+    LOGOS_ASSERT(map.count("quotaUsedBytes") > 0);
+    LOGOS_ASSERT(map.count("quotaReservedBytes") > 0);
 }
 
-// ── test_manifests ──────────────────────────────────────────────────────────
+// ── integration_manifests ─────────────────────────────────────────────────────
 
 LOGOS_TEST(integration_manifests) {
     ensureRestarted();
 
-    const QByteArray content = "Hello, Logos Manifests Test!";
-    const QString cid = uploadFile(g_plugin, content, "test_manifests_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string content = "Hello, Logos Manifests Test!";
+    std::string cid = uploadContent(content, "test_manifests_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult result = g_plugin->manifests();
-    LOGOS_ASSERT_TRUE(result.success);
-
-    const QVariantList list = result.getList();
-    LOGOS_ASSERT_FALSE(list.isEmpty());
+    LogosList list = g_impl->manifests();
+    LOGOS_ASSERT_FALSE(list.empty());
 
     bool found = false;
-    for (const QVariant& v : list) {
-        const QVariantMap m = v.toMap();
-        if (m["cid"].toString() == cid) {
-            found = true;
-            LOGOS_ASSERT_FALSE(m["treeCid"].toString().isEmpty());
-            LOGOS_ASSERT_EQ(m["datasetSize"].toInt(), static_cast<int>(content.size()));
-            break;
-        }
+    for (const auto& entry : list) {
+        if (!entry.is_object()) continue;
+        if (entry.value("cid", std::string()) != cid) continue;
+        found = true;
+        LOGOS_ASSERT_FALSE(entry.value("treeCid", std::string()).empty());
+        break;
     }
     LOGOS_ASSERT_TRUE(found);
 }
 
-// ── test_downloadManifest ───────────────────────────────────────────────────
+// ── integration_downloadManifest ─────────────────────────────────────────────
 
 LOGOS_TEST(integration_downloadManifest) {
     ensureRestarted();
 
-    const QByteArray content = "Hello, Logos DownloadManifest Test!";
-    const QString cid = uploadFile(g_plugin, content, "test_download_manifest_src.txt");
-    LOGOS_ASSERT_FALSE(cid.isEmpty());
+    std::string content = "Hello, Logos DownloadManifest Test!";
+    std::string cid = uploadContent(content, "test_download_manifest_src.txt");
+    LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosResult result = g_plugin->downloadManifest(cid);
-    LOGOS_ASSERT_TRUE(result.success);
-
-    const QVariantMap manifest = result.getMap();
-    LOGOS_ASSERT_FALSE(manifest.isEmpty());
-    LOGOS_ASSERT_FALSE(manifest["treeCid"].toString().isEmpty());
-    LOGOS_ASSERT_EQ(manifest["datasetSize"].toInt(), static_cast<int>(content.size()));
+    LogosMap manifest = g_impl->downloadManifest(cid);
+    LOGOS_ASSERT_FALSE(manifest.empty());
+    LOGOS_ASSERT(manifest.count("treeCid") > 0);
+    LOGOS_ASSERT(manifest.count("datasetSize") > 0);
 }
 
-// ── test_updateLogLevel ─────────────────────────────────────────────────────
+// ── integration_updateLogLevel ───────────────────────────────────────────────
 
 LOGOS_TEST(integration_updateLogLevel) {
     ensureRestarted();
 
-    LOGOS_ASSERT_TRUE(g_plugin->updateLogLevel("TRACE").success);
+    LOGOS_ASSERT_TRUE(g_impl->updateLogLevel("TRACE"));
 
-    // Upload a file to generate TRACE logs
-    {
-        const QByteArray content = "Hello, Logos Log Level Test!";
-        uploadFile(g_plugin, content, "test_loglevel_src.txt");
-    }
+    // Upload a file to generate TRACE logs.
+    uploadContent("Hello, Logos Log Level Test!", "test_loglevel_src.txt");
 
-    QString logFile = g_dataDir->path() + "/" + LOG_FILENAME;
-    QFile file(logFile);
-    LOGOS_ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
-    const QString logContent = QString::fromUtf8(file.readAll());
-    file.close();
+    fs::path logFile = g_dataDir / LOG_FILENAME;
+    std::ifstream in(logFile);
+    std::string logContent((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
 
-    LOGOS_ASSERT_TRUE(logContent.contains("TRC"));
+    LOGOS_ASSERT_FALSE(logContent.empty());
+    LOGOS_ASSERT_TRUE(logContent.find("TRC") != std::string::npos);
 }

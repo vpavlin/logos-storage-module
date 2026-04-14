@@ -19,6 +19,7 @@
       };
       tests = {
         dir = ./tests;
+        mockCLibs = [ "libstorage" ];
       };
     };
 }
