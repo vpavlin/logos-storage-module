@@ -413,89 +413,87 @@ bool StorageModuleImpl::start() {
     return true;
 }
 
-bool StorageModuleImpl::stop() {
+StdLogosResult StorageModuleImpl::stop() {
     fprintf(stderr, "StorageModuleImpl::stop called\n");
-    if (!storageCtx) {
-        fprintf(stderr, "StorageModuleImpl::stop: context not initialized\n");
-        return false;
-    }
+    if (!storageCtx)
+        return {false, {}, "Storage context not initialized."};
     auto* ctx = new SimpleEventCtx(this, "storageStop");
     ctx->isStartedFlag = &isStarted;
     ctx->flagValueOnOk = false;
     if (storage_stop(storageCtx, asyncDispatch, ctx) != RET_OK) {
         delete ctx;
-        return false;
+        return {false, {}, "Failed to send stop command."};
     }
-    return true;
+    return {true, {}, ""};
 }
 
-bool StorageModuleImpl::destroy() {
+StdLogosResult StorageModuleImpl::destroy() {
     fprintf(stderr, "StorageModuleImpl::destroy called\n");
-    // Best-effort close (ignore errors).
     if (storageCtx) {
         syncCallNoArg(storageCtx, storage_close, 1000);
     }
     int ret = storage_destroy(storageCtx);
     if (ret == RET_OK) {
         storageCtx = nullptr;
-        return true;
+        return {true, {}, ""};
     }
-    return false;
+    return {false, {}, "Failed to destroy storage context."};
 }
 
 // ---------------------------------------------------------------------------
 // Info
 // ---------------------------------------------------------------------------
 
-std::string StorageModuleImpl::version() {
+StdLogosResult StorageModuleImpl::version() {
     char* v = storage_version(storageCtx);
-    if (!v) return {};
+    if (!v) return {false, {}, "Failed to get version."};
     std::string result(v);
     free(v);
-    return result;
+    return {true, result, ""};
 }
 
-std::string StorageModuleImpl::dataDir() {
+StdLogosResult StorageModuleImpl::dataDir() {
     auto r = syncCallNoArg(storageCtx, storage_repo, 1000);
-    return r.ok ? r.message : std::string();
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
 }
 
-std::string StorageModuleImpl::peerId() {
+StdLogosResult StorageModuleImpl::peerId() {
     auto r = syncCallNoArg(storageCtx, storage_peer_id, 1000);
-    return r.ok ? r.message : std::string();
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
 }
 
-std::string StorageModuleImpl::spr() {
+StdLogosResult StorageModuleImpl::spr() {
     auto r = syncCallNoArg(storageCtx, storage_spr, 1000);
-    return r.ok ? r.message : std::string();
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
 }
 
-LogosMap StorageModuleImpl::debug() {
+StdLogosResult StorageModuleImpl::debug() {
     auto r = syncCallNoArg(storageCtx, storage_debug, 1000);
-    if (!r.ok) return {};
+    if (!r.ok) return {false, {}, r.message};
     try {
-        json doc = json::parse(r.message);
-        LogosMap result;
-        for (auto& [key, val] : doc.items()) {
-            result[key] = val.dump();
-        }
-        return result;
+        return {true, json::parse(r.message), ""};
     } catch (...) {
-        return {};
+        return {false, {}, "Failed to parse debug info."};
     }
 }
 
-bool StorageModuleImpl::updateLogLevel(const std::string& logLevel) {
-    return syncCallString(storageCtx, storage_log_level, logLevel, 1000).ok;
+StdLogosResult StorageModuleImpl::updateLogLevel(const std::string& logLevel) {
+    auto r = syncCallString(storageCtx, storage_log_level, logLevel, 1000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, {}, ""};
 }
 
 // ---------------------------------------------------------------------------
 // Connect
 // ---------------------------------------------------------------------------
 
-bool StorageModuleImpl::connect(const std::string& peerId,
-                                 const std::vector<std::string>& peerAddresses) {
-    if (!storageCtx) return false;
+StdLogosResult StorageModuleImpl::connect(const std::string& peerId,
+                                           const std::vector<std::string>& peerAddresses) {
+    if (!storageCtx)
+        return {false, {}, "Storage context not initialized."};
     std::vector<char*> addrs;
     addrs.reserve(peerAddresses.size());
     for (const auto& a : peerAddresses) addrs.push_back(strdup(a.c_str()));
@@ -505,69 +503,79 @@ bool StorageModuleImpl::connect(const std::string& peerId,
                         const_cast<const char**>(ctx->addrs.data()),
                         ctx->addrs.size(), asyncDispatch, ctx) != RET_OK) {
         delete ctx;
-        return false;
+        return {false, {}, "Failed to send connect command."};
     }
-    return true;
+    return {true, {}, ""};
 }
 
 // ---------------------------------------------------------------------------
 // Upload
 // ---------------------------------------------------------------------------
 
-std::string StorageModuleImpl::uploadInit(const std::string& filename,
-                                           int64_t chunkSize) {
+StdLogosResult StorageModuleImpl::uploadInit(const std::string& filename,
+                                              int64_t chunkSize) {
     auto r = syncCallStringSize(storageCtx, storage_upload_init, filename,
                                 static_cast<size_t>(chunkSize), 1000);
-    return r.ok ? r.message : std::string();
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
 }
 
-std::string StorageModuleImpl::uploadUrl(const std::string& filePath,
-                                          int64_t chunkSize) {
+StdLogosResult StorageModuleImpl::uploadUrl(const std::string& filePath,
+                                             int64_t chunkSize) {
     fprintf(stderr, "StorageModuleImpl::uploadUrl called with path=%s\n",
             filePath.c_str());
-    if (!storageCtx || chunkSize <= 0) return {};
+    if (!storageCtx || chunkSize <= 0)
+        return {false, {}, "Invalid arguments."};
 
     std::error_code ec;
     if (!fs::exists(filePath, ec) || !fs::is_regular_file(filePath, ec)) {
         fprintf(stderr, "StorageModuleImpl::uploadUrl: file not found or not regular: %s\n",
                 filePath.c_str());
-        return {};
+        return {false, {}, "File not found: " + filePath};
     }
 
     int64_t fileSize = static_cast<int64_t>(fs::file_size(filePath, ec));
-    std::string sessionId = uploadInit(filePath, chunkSize);
-    if (sessionId.empty()) return {};
+
+    auto ir = syncCallStringSize(storageCtx, storage_upload_init, filePath,
+                                  static_cast<size_t>(chunkSize), 1000);
+    if (!ir.ok)
+        return {false, {}, ir.message};
+    std::string sessionId = ir.message;
 
     auto* ctx = new UploadFileCtx(this, sessionId, fileSize);
     if (storage_upload_file(storageCtx, ctx->sessionId.c_str(),
                             asyncDispatch, ctx) != RET_OK) {
         delete ctx;
-        uploadCancel(sessionId);
-        return {};
+        syncCallString(storageCtx, storage_upload_cancel, sessionId, 1000);
+        return {false, {}, "Failed to start file upload."};
     }
-    return sessionId;
+    return {true, sessionId, ""};
 }
 
-bool StorageModuleImpl::uploadChunk(const std::string& sessionId,
-                                     const std::string& chunk) {
-    if (!storageCtx) return false;
+StdLogosResult StorageModuleImpl::uploadChunk(const std::string& sessionId,
+                                               const std::string& chunk) {
+    if (!storageCtx)
+        return {false, {}, "Storage context not initialized."};
     auto* ctx = new UploadChunkCtx(this, sessionId, chunk);
     const auto* data = reinterpret_cast<const uint8_t*>(ctx->chunk.data());
     if (storage_upload_chunk(storageCtx, ctx->sessionId.c_str(), data,
                              ctx->chunk.size(), asyncDispatch, ctx) != RET_OK) {
         delete ctx;
-        return false;
+        return {false, {}, "Failed to send chunk."};
     }
-    return true;
+    return {true, {}, ""};
 }
 
-std::string StorageModuleImpl::uploadFinalize(const std::string& sessionId) {
+StdLogosResult StorageModuleImpl::uploadFinalize(const std::string& sessionId) {
     auto r = syncCallString(storageCtx, storage_upload_finalize, sessionId, 1000);
-    return r.ok ? r.message : std::string();
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message, ""};
 }
 
-bool StorageModuleImpl::uploadCancel(const std::string& sessionId) {
-    return syncCallString(storageCtx, storage_upload_cancel, sessionId, 1000).ok;
+StdLogosResult StorageModuleImpl::uploadCancel(const std::string& sessionId) {
+    auto r = syncCallString(storageCtx, storage_upload_cancel, sessionId, 1000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, {}, ""};
 }
 
 // ---------------------------------------------------------------------------
@@ -580,34 +588,34 @@ std::string StorageModuleImpl::downloadChunksInternal(const std::string& cid,
                                                        int64_t chunkSize) {
     if (!storageCtx || chunkSize <= 0) return {};
 
-    // For file-mode download, get the manifest first so we can throttle progress
-    // events to one per percentage point.
+    // For file-mode download, fetch the manifest to throttle progress events.
     int64_t totalBytes = 0;
     if (!filepath.empty()) {
-        LogosMap manifest = downloadManifest(cid);
-        if (manifest.empty()) {
+        auto mr = syncCallString(storageCtx, storage_download_manifest, cid, 3000);
+        if (mr.ok) {
+            try {
+                json doc = json::parse(mr.message);
+                if (doc.contains("datasetSize") && !doc["datasetSize"].is_null()) {
+                    const auto& ds = doc["datasetSize"];
+                    if (ds.is_number_integer()) totalBytes = ds.get<int64_t>();
+                    else if (ds.is_number()) totalBytes = static_cast<int64_t>(ds.get<double>());
+                    else if (ds.is_string()) totalBytes = std::stoll(ds.get_ref<const std::string&>());
+                }
+            } catch (...) {}
+        }
+        if (totalBytes == 0) {
             fprintf(stderr,
                     "StorageModuleImpl::downloadChunksInternal: failed to get "
                     "manifest for %s\n",
                     cid.c_str());
             return {};
         }
-        if (manifest.contains("datasetSize") && !manifest["datasetSize"].is_null()) {
-            const auto& ds = manifest["datasetSize"];
-            try {
-                if (ds.is_number_integer()) totalBytes = ds.get<int64_t>();
-                else if (ds.is_number()) totalBytes = static_cast<int64_t>(ds.get<double>());
-                else if (ds.is_string()) totalBytes = std::stoll(ds.get_ref<const std::string&>());
-            } catch (...) {}
-        }
     }
 
-    // Init download session.
     auto r = syncCallDownloadInit(storageCtx, storage_download_init, cid,
                                   static_cast<size_t>(chunkSize), local, 1000);
     if (!r.ok) return {};
 
-    // Start streaming.
     auto* ctx = new DownloadStreamCtx(this, cid, filepath, totalBytes);
     if (storage_download_stream(storageCtx, ctx->cid.c_str(),
                                 static_cast<size_t>(chunkSize), local,
@@ -619,90 +627,95 @@ std::string StorageModuleImpl::downloadChunksInternal(const std::string& cid,
     return cid;
 }
 
-std::string StorageModuleImpl::downloadToUrl(const std::string& cid,
-                                              const std::string& filePath,
-                                              bool local, int64_t chunkSize) {
-    return downloadChunksInternal(cid, filePath, local, chunkSize);
+StdLogosResult StorageModuleImpl::downloadToUrl(const std::string& cid,
+                                                 const std::string& filePath,
+                                                 bool local, int64_t chunkSize) {
+    std::string sessionId = downloadChunksInternal(cid, filePath, local, chunkSize);
+    if (sessionId.empty())
+        return {false, {}, "Failed to start download."};
+    return {true, sessionId, ""};
 }
 
-std::string StorageModuleImpl::downloadChunks(const std::string& cid, bool local,
-                                               int64_t chunkSize) {
-    return downloadChunksInternal(cid, "", local, chunkSize);
+StdLogosResult StorageModuleImpl::downloadChunks(const std::string& cid, bool local,
+                                                  int64_t chunkSize) {
+    std::string sessionId = downloadChunksInternal(cid, "", local, chunkSize);
+    if (sessionId.empty())
+        return {false, {}, "Failed to start chunk download."};
+    return {true, sessionId, ""};
 }
 
-bool StorageModuleImpl::downloadCancel(const std::string& sessionId) {
-    return syncCallString(storageCtx, storage_download_cancel, sessionId, 1000).ok;
+StdLogosResult StorageModuleImpl::downloadCancel(const std::string& sessionId) {
+    auto r = syncCallString(storageCtx, storage_download_cancel, sessionId, 1000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, {}, ""};
 }
 
 // ---------------------------------------------------------------------------
 // Data management
 // ---------------------------------------------------------------------------
 
-bool StorageModuleImpl::exists(const std::string& cid) {
+StdLogosResult StorageModuleImpl::exists(const std::string& cid) {
     auto r = syncCallString(storageCtx, storage_exists, cid, 1000);
-    return r.ok && r.message == "true";
+    if (!r.ok) return {false, {}, r.message};
+    return {true, r.message == "true", ""};
 }
 
-bool StorageModuleImpl::fetch(const std::string& cid) {
-    return syncCallString(storageCtx, storage_fetch, cid, 3000).ok;
+StdLogosResult StorageModuleImpl::fetch(const std::string& cid) {
+    auto r = syncCallString(storageCtx, storage_fetch, cid, 3000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, {}, ""};
 }
 
-bool StorageModuleImpl::remove(const std::string& cid) {
-    return syncCallString(storageCtx, storage_delete, cid, 3000).ok;
+StdLogosResult StorageModuleImpl::remove(const std::string& cid) {
+    auto r = syncCallString(storageCtx, storage_delete, cid, 3000);
+    if (!r.ok) return {false, {}, r.message};
+    return {true, {}, ""};
 }
 
-LogosMap StorageModuleImpl::space() {
+StdLogosResult StorageModuleImpl::space() {
     auto r = syncCallNoArg(storageCtx, storage_space, 1000);
-    if (!r.ok) return {};
+    if (!r.ok) return {false, {}, r.message};
     try {
-        json doc = json::parse(r.message);
-        LogosMap result;
-        for (auto& [key, val] : doc.items()) {
-            result[key] = val.dump();
-        }
-        return result;
+        return {true, json::parse(r.message), ""};
     } catch (...) {
-        return {};
+        return {false, {}, "Failed to parse space info."};
     }
 }
 
-LogosList StorageModuleImpl::manifests() {
+StdLogosResult StorageModuleImpl::manifests() {
     auto r = syncCallNoArg(storageCtx, storage_list, 1000);
-    if (!r.ok) return {};
+    if (!r.ok) return {false, {}, r.message};
     try {
-        json doc = json::parse(r.message);
-        if (!doc.is_array()) return {};
-        LogosList result = json::array();
-        for (const auto& item : doc) {
-            json mobj = item.value("manifest", json::object());
-            LogosMap entry;
-            entry["cid"]         = item.value("cid", "");
-            entry["treeCid"]     = mobj.value("treeCid", "");
-            entry["datasetSize"] = std::to_string(mobj.value("datasetSize", 0));
-            entry["blockSize"]   = std::to_string(mobj.value("blockSize", 0));
-            entry["filename"]    = mobj.value("filename", "");
-            entry["mimetype"]    = mobj.value("mimetype", "");
-            result.push_back(entry);
+        json raw = json::parse(r.message);
+        if (!raw.is_array())
+            return {false, {}, "Failed to parse manifests."};
+        json list = json::array();
+        for (const auto& item : raw) {
+            json entry;
+            if (item.contains("cid"))      entry["cid"]         = item["cid"];
+            if (item.contains("manifest")) {
+                const auto& m = item["manifest"];
+                if (m.contains("treeCid"))     entry["treeCid"]     = m["treeCid"];
+                if (m.contains("datasetSize")) entry["datasetSize"] = m["datasetSize"];
+                if (m.contains("blockSize"))   entry["blockSize"]   = m["blockSize"];
+                if (m.contains("filename"))    entry["filename"]    = m["filename"];
+                if (m.contains("mimetype"))    entry["mimetype"]    = m["mimetype"];
+            }
+            list.push_back(entry);
         }
-        return result;
+        return {true, list, ""};
     } catch (...) {
-        return {};
+        return {false, {}, "Failed to parse manifests."};
     }
 }
 
-LogosMap StorageModuleImpl::downloadManifest(const std::string& cid) {
+StdLogosResult StorageModuleImpl::downloadManifest(const std::string& cid) {
     auto r = syncCallString(storageCtx, storage_download_manifest, cid, 3000);
-    if (!r.ok) return {};
+    if (!r.ok) return {false, {}, r.message};
     try {
-        json doc = json::parse(r.message);
-        if (!doc.is_object()) return {};
-        LogosMap result;
-        for (auto& [key, val] : doc.items()) {
-            result[key] = val.dump();
-        }
-        return result;
+        return {true, json::parse(r.message), ""};
     } catch (...) {
-        return {};
+        return {false, {}, "Failed to parse manifest."};
     }
 }
 
@@ -725,13 +738,16 @@ void StorageModuleImpl::importFiles(const std::string& path) {
         std::string fp = entry.path().string();
         fprintf(stderr, "StorageModuleImpl::importFiles: uploading %s\n",
                 fp.c_str());
-        std::string sid = uploadUrl(fp, 65536);
-        if (sid.empty()) {
+        StdLogosResult result = uploadUrl(fp, 65536);
+        if (!result.success) {
             fprintf(stderr,
                     "StorageModuleImpl::importFiles: failed to start upload "
                     "for %s\n",
                     fp.c_str());
         } else {
+            std::string sid = result.value.is_string()
+                                  ? result.value.get<std::string>()
+                                  : std::string();
             fprintf(stderr,
                     "StorageModuleImpl::importFiles: upload started, "
                     "session=%s\n",

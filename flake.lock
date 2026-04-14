@@ -96,12 +96,10 @@
         ]
       },
       "locked": {
-        "lastModified": 1776101366,
-        "narHash": "sha256-HxkzOs2xv0grkNAJMBLXKDjVl8Z+z3YFn+sC4eFKy/8=",
-        "owner": "logos-co",
-        "repo": "logos-cpp-sdk",
-        "rev": "1468180b2567f4c59346bb94f74951e76341f5c5",
-        "type": "github"
+        "lastModified": 1776190628,
+        "narHash": "sha256-Hi+2UW6E9H5rrSh76FAsbbl33AybqjdQyoDeNMOsgPg=",
+        "path": "/Users/iurimatias/Projects/Logos/logos-workspace/repos/logos-cpp-sdk",
+        "type": "path"
       },
       "original": {
         "owner": "logos-co",
@@ -344,8 +342,8 @@
         ]
       },
       "locked": {
-        "lastModified": 1776178524,
-        "narHash": "sha256-oCddvgm4CEEbNPSHgUthktSwu/Hwv86p0wsrDOReMOc=",
+        "lastModified": 1776191198,
+        "narHash": "sha256-VBWpmBCrfzEo3ZVKW7EaWuh3WUisf/dicYprq7Jeyf8=",
         "path": "/Users/iurimatias/Projects/Logos/logos-workspace/repos/logos-module-builder",
         "type": "path"
       },

@@ -1,4 +1,4 @@
-// Integration tests for StorageModuleImpl — uses the REAL libstorage library.
+// Integration tests for StorageModuleImpl - uses the REAL libstorage library.
 // No mocking. These tests start an actual storage node, upload/download real data,
 // and verify end-to-end behavior.
 //
@@ -7,6 +7,8 @@
 
 #include <logos_test.h>
 #include "storage_module_plugin.h"
+
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -18,13 +20,14 @@
 #include <string>
 
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 
 static const int DEFAULT_TIMEOUT_MS = 3000;
 static const int START_TIMEOUT_MS   = 15000;
 static const std::string LOG_FILENAME = "storage.log";
 
 // ---------------------------------------------------------------------------
-// EventWaiter — replaces QEventLoop + storageResponse signal.
+// EventWaiter - replaces QEventLoop + storageResponse signal.
 // Collects named events emitted via StorageModuleImpl::emitEvent.
 // ---------------------------------------------------------------------------
 
@@ -72,7 +75,7 @@ struct EventWaiter {
 };
 
 // ---------------------------------------------------------------------------
-// Shared impl instance — restarted before each test.
+// Shared impl instance - restarted before each test.
 // ---------------------------------------------------------------------------
 
 static StorageModuleImpl* g_impl = nullptr;
@@ -131,8 +134,8 @@ static std::string uploadContent(const std::string& content,
     f.close();
 
     g_waiter.reset();
-    std::string sid = g_impl->uploadUrl(filePath.string(), 65536);
-    if (sid.empty()) return {};
+    StdLogosResult sr = g_impl->uploadUrl(filePath.string(), 65536);
+    if (!sr.success) return {};
 
     if (!g_waiter.waitFor("storageUploadDone", DEFAULT_TIMEOUT_MS)) return {};
 
@@ -186,51 +189,57 @@ static std::string collectDownloadChunks(int timeoutMs) {
     return success ? collected : std::string();
 }
 
-// ── integration_version ─────────────────────────────────────────────────────
+// integration_version
 
 LOGOS_TEST(integration_version) {
     ensureRestarted();
-    std::string v = g_impl->version();
-    LOGOS_ASSERT_FALSE(v.empty());
+    StdLogosResult r = g_impl->version();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_FALSE(r.value.get<std::string>().empty());
 }
 
-// ── integration_dataDir ──────────────────────────────────────────────────────
+// integration_dataDir
 
 LOGOS_TEST(integration_dataDir) {
     ensureRestarted();
-    std::string d = g_impl->dataDir();
-    LOGOS_ASSERT_EQ(d, g_dataDir.string());
+    StdLogosResult r = g_impl->dataDir();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_EQ(r.value.get<std::string>(), g_dataDir.string());
 }
 
-// ── integration_peerId ───────────────────────────────────────────────────────
+// integration_peerId
 
 LOGOS_TEST(integration_peerId) {
     ensureRestarted();
-    std::string id = g_impl->peerId();
-    LOGOS_ASSERT_FALSE(id.empty());
+    StdLogosResult r = g_impl->peerId();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_FALSE(r.value.get<std::string>().empty());
 }
 
-// ── integration_debug ────────────────────────────────────────────────────────
+// integration_debug
 
 LOGOS_TEST(integration_debug) {
     ensureRestarted();
-    LogosMap map = g_impl->debug();
-    LOGOS_ASSERT_FALSE(map.empty());
-    LOGOS_ASSERT(map.count("id") > 0);
-    LOGOS_ASSERT(map.count("addrs") > 0);
-    LOGOS_ASSERT(map.count("announceAddresses") > 0);
-    LOGOS_ASSERT(map.count("table") > 0);
+    StdLogosResult r = g_impl->debug();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_TRUE(r.value.is_object());
+    LOGOS_ASSERT_FALSE(r.value.empty());
+    LOGOS_ASSERT_TRUE(r.value.contains("id"));
+    LOGOS_ASSERT_TRUE(r.value.contains("addrs"));
+    LOGOS_ASSERT_TRUE(r.value.contains("announceAddresses"));
+    LOGOS_ASSERT_TRUE(r.value.contains("table"));
 }
 
-// ── integration_spr ──────────────────────────────────────────────────────────
+// integration_spr
 
 LOGOS_TEST(integration_spr) {
     ensureRestarted();
-    std::string s = g_impl->spr();
-    LOGOS_ASSERT_FALSE(s.empty());
+    StdLogosResult r = g_impl->spr();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_FALSE(r.value.get<std::string>().empty());
 }
 
-// ── integration_uploadFile ───────────────────────────────────────────────────
+// integration_uploadFile
 
 LOGOS_TEST(integration_uploadFile) {
     ensureRestarted();
@@ -238,7 +247,7 @@ LOGOS_TEST(integration_uploadFile) {
     LOGOS_ASSERT_FALSE(cid.empty());
 }
 
-// ── integration_uploadWorkflowManual ─────────────────────────────────────────
+// integration_uploadWorkflowManual
 
 LOGOS_TEST(integration_uploadWorkflowManual) {
     ensureRestarted();
@@ -249,16 +258,19 @@ LOGOS_TEST(integration_uploadWorkflowManual) {
     f.write(content.data(), static_cast<std::streamsize>(content.size()));
     f.close();
 
-    std::string sid = g_impl->uploadInit(filePath.string(), 65536);
+    StdLogosResult initR = g_impl->uploadInit(filePath.string(), 65536);
+    LOGOS_ASSERT_TRUE(initR.success);
+    std::string sid = initR.value.get<std::string>();
     LOGOS_ASSERT_FALSE(sid.empty());
 
-    LOGOS_ASSERT_TRUE(g_impl->uploadChunk(sid, content));
+    LOGOS_ASSERT_TRUE(g_impl->uploadChunk(sid, content).success);
 
-    std::string cid = g_impl->uploadFinalize(sid);
-    LOGOS_ASSERT_FALSE(cid.empty());
+    StdLogosResult finalizeR = g_impl->uploadFinalize(sid);
+    LOGOS_ASSERT_TRUE(finalizeR.success);
+    LOGOS_ASSERT_FALSE(finalizeR.value.get<std::string>().empty());
 }
 
-// ── integration_downloadFile ─────────────────────────────────────────────────
+// integration_downloadFile
 
 LOGOS_TEST(integration_downloadFile) {
     ensureRestarted();
@@ -270,8 +282,8 @@ LOGOS_TEST(integration_downloadFile) {
     fs::path downloadPath = g_dataDir / "test_download_result.txt";
 
     g_waiter.reset();
-    std::string sid = g_impl->downloadToUrl(cid, downloadPath.string(), false, 65536);
-    LOGOS_ASSERT_FALSE(sid.empty());
+    StdLogosResult dlR = g_impl->downloadToUrl(cid, downloadPath.string(), false, 65536);
+    LOGOS_ASSERT_TRUE(dlR.success);
 
     LOGOS_ASSERT_TRUE(g_waiter.waitFor("storageDownloadDone", DEFAULT_TIMEOUT_MS));
 
@@ -281,7 +293,7 @@ LOGOS_TEST(integration_downloadFile) {
     LOGOS_ASSERT_EQ(downloaded, content);
 }
 
-// ── integration_downloadChunks ───────────────────────────────────────────────
+// integration_downloadChunks
 
 LOGOS_TEST(integration_downloadChunks) {
     ensureRestarted();
@@ -291,15 +303,15 @@ LOGOS_TEST(integration_downloadChunks) {
     LOGOS_ASSERT_FALSE(cid.empty());
 
     // collectDownloadChunks installs a custom emitEvent handler.
-    std::string sid = g_impl->downloadChunks(cid, false, 65536);
-    LOGOS_ASSERT_FALSE(sid.empty());
+    StdLogosResult dlR = g_impl->downloadChunks(cid, false, 65536);
+    LOGOS_ASSERT_TRUE(dlR.success);
 
     std::string downloaded = collectDownloadChunks(DEFAULT_TIMEOUT_MS);
     LOGOS_ASSERT_FALSE(downloaded.empty());
     LOGOS_ASSERT_EQ(downloaded, content);
 }
 
-// ── integration_exists ───────────────────────────────────────────────────────
+// integration_exists
 
 LOGOS_TEST(integration_exists) {
     ensureRestarted();
@@ -307,10 +319,12 @@ LOGOS_TEST(integration_exists) {
     std::string cid = uploadContent("Hello, Logos Exists Test!", "test_exists_src.txt");
     LOGOS_ASSERT_FALSE(cid.empty());
 
-    LOGOS_ASSERT_TRUE(g_impl->exists(cid));
+    StdLogosResult r = g_impl->exists(cid);
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_TRUE(r.value.get<bool>());
 }
 
-// ── integration_fetch ────────────────────────────────────────────────────────
+// integration_fetch
 
 LOGOS_TEST(integration_fetch) {
     ensureRestarted();
@@ -318,10 +332,10 @@ LOGOS_TEST(integration_fetch) {
     std::string cid = uploadContent("Hello, Logos Fetch Test!", "test_fetch_src.txt");
     LOGOS_ASSERT_FALSE(cid.empty());
 
-    LOGOS_ASSERT_TRUE(g_impl->fetch(cid));
+    LOGOS_ASSERT_TRUE(g_impl->fetch(cid).success);
 }
 
-// ── integration_remove ───────────────────────────────────────────────────────
+// integration_remove
 
 LOGOS_TEST(integration_remove) {
     ensureRestarted();
@@ -329,25 +343,33 @@ LOGOS_TEST(integration_remove) {
     std::string cid = uploadContent("Hello, Logos Remove Test!", "test_remove_src.txt");
     LOGOS_ASSERT_FALSE(cid.empty());
 
-    LOGOS_ASSERT_TRUE(g_impl->exists(cid));
-    LOGOS_ASSERT_TRUE(g_impl->remove(cid));
-    LOGOS_ASSERT_FALSE(g_impl->exists(cid));
+    StdLogosResult e1 = g_impl->exists(cid);
+    LOGOS_ASSERT_TRUE(e1.success);
+    LOGOS_ASSERT_TRUE(e1.value.get<bool>());
+
+    LOGOS_ASSERT_TRUE(g_impl->remove(cid).success);
+
+    StdLogosResult e2 = g_impl->exists(cid);
+    LOGOS_ASSERT_TRUE(e2.success);
+    LOGOS_ASSERT_FALSE(e2.value.get<bool>());
 }
 
-// ── integration_space ────────────────────────────────────────────────────────
+// integration_space
 
 LOGOS_TEST(integration_space) {
     ensureRestarted();
 
-    LogosMap map = g_impl->space();
-    LOGOS_ASSERT_FALSE(map.empty());
-    LOGOS_ASSERT(map.count("totalBlocks") > 0);
-    LOGOS_ASSERT(map.count("quotaMaxBytes") > 0);
-    LOGOS_ASSERT(map.count("quotaUsedBytes") > 0);
-    LOGOS_ASSERT(map.count("quotaReservedBytes") > 0);
+    StdLogosResult r = g_impl->space();
+    LOGOS_ASSERT_TRUE(r.success);
+    LOGOS_ASSERT_TRUE(r.value.is_object());
+    LOGOS_ASSERT_FALSE(r.value.empty());
+    LOGOS_ASSERT_TRUE(r.value.contains("totalBlocks"));
+    LOGOS_ASSERT_TRUE(r.value.contains("quotaMaxBytes"));
+    LOGOS_ASSERT_TRUE(r.value.contains("quotaUsedBytes"));
+    LOGOS_ASSERT_TRUE(r.value.contains("quotaReservedBytes"));
 }
 
-// ── integration_manifests ─────────────────────────────────────────────────────
+// integration_manifests
 
 LOGOS_TEST(integration_manifests) {
     ensureRestarted();
@@ -356,21 +378,23 @@ LOGOS_TEST(integration_manifests) {
     std::string cid = uploadContent(content, "test_manifests_src.txt");
     LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosList list = g_impl->manifests();
-    LOGOS_ASSERT_FALSE(list.empty());
+    StdLogosResult lr = g_impl->manifests();
+    LOGOS_ASSERT_TRUE(lr.success);
+    LOGOS_ASSERT_TRUE(lr.value.is_array());
+    LOGOS_ASSERT_FALSE(lr.value.empty());
 
     bool found = false;
-    for (const auto& entry : list) {
-        if (!entry.is_object()) continue;
-        if (entry.value("cid", std::string()) != cid) continue;
+    for (const auto& entry : lr.value) {
+        if (!entry.contains("cid") || entry["cid"].get<std::string>() != cid) continue;
         found = true;
-        LOGOS_ASSERT_FALSE(entry.value("treeCid", std::string()).empty());
+        LOGOS_ASSERT_TRUE(entry.contains("treeCid"));
+        LOGOS_ASSERT_FALSE(entry["treeCid"].get<std::string>().empty());
         break;
     }
     LOGOS_ASSERT_TRUE(found);
 }
 
-// ── integration_downloadManifest ─────────────────────────────────────────────
+// integration_downloadManifest
 
 LOGOS_TEST(integration_downloadManifest) {
     ensureRestarted();
@@ -379,18 +403,20 @@ LOGOS_TEST(integration_downloadManifest) {
     std::string cid = uploadContent(content, "test_download_manifest_src.txt");
     LOGOS_ASSERT_FALSE(cid.empty());
 
-    LogosMap manifest = g_impl->downloadManifest(cid);
-    LOGOS_ASSERT_FALSE(manifest.empty());
-    LOGOS_ASSERT(manifest.count("treeCid") > 0);
-    LOGOS_ASSERT(manifest.count("datasetSize") > 0);
+    StdLogosResult mr = g_impl->downloadManifest(cid);
+    LOGOS_ASSERT_TRUE(mr.success);
+    LOGOS_ASSERT_TRUE(mr.value.is_object());
+    LOGOS_ASSERT_FALSE(mr.value.empty());
+    LOGOS_ASSERT_TRUE(mr.value.contains("treeCid"));
+    LOGOS_ASSERT_TRUE(mr.value.contains("datasetSize"));
 }
 
-// ── integration_updateLogLevel ───────────────────────────────────────────────
+// integration_updateLogLevel
 
 LOGOS_TEST(integration_updateLogLevel) {
     ensureRestarted();
 
-    LOGOS_ASSERT_TRUE(g_impl->updateLogLevel("TRACE"));
+    LOGOS_ASSERT_TRUE(g_impl->updateLogLevel("TRACE").success);
 
     // Upload a file to generate TRACE logs.
     uploadContent("Hello, Logos Log Level Test!", "test_loglevel_src.txt");

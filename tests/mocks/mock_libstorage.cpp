@@ -50,7 +50,7 @@ int storage_destroy(void* ctx) {
     return RET_OK;
 }
 
-// ── No-arg async functions (StorageNoArgFunction) ───────────────────────────
+// No-arg async functions (StorageNoArgFunction)
 
 int storage_start(void* ctx, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_start");
@@ -106,7 +106,7 @@ int storage_list(void* ctx, StorageCallback cb, void* userData) {
     return RET_OK;
 }
 
-// ── String-arg async functions (StorageStringArgFunction) ───────────────────
+// String-arg async functions (StorageStringArgFunction)
 
 int storage_log_level(void* ctx, const char* logLevel, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_log_level");
@@ -144,7 +144,7 @@ int storage_download_cancel(void* ctx, const char* cid, StorageCallback cb, void
     return RET_OK;
 }
 
-// ── String+size_t async functions (StorageStringArgAndIntArgFunction) ───────
+// String+size_t async functions (StorageStringArgAndIntArgFunction)
 
 int storage_fetch(void* ctx, const char* cid, StorageCallback cb, void* userData) {
     LOGOS_CMOCK_RECORD("storage_fetch");
@@ -171,7 +171,7 @@ int storage_upload_init(void* ctx, const char* filepath, size_t chunkSize,
     return RET_OK;
 }
 
-// ── Multi-arg functions ─────────────────────────────────────────────────────
+// Multi-arg functions
 
 int storage_connect(void* ctx, const char* peerId, const char** addrs,
                     size_t addrsSize, StorageCallback cb, void* userData) {

@@ -1,4 +1,4 @@
-// Stub header for libstorage — provides the same declarations as the real
+// Stub header for libstorage - provides the same declarations as the real
 // Nim-generated header so that storage_module sources compile in tests.
 // Signatures match the branch used by the module (fix/delete-dataset-crash).
 
