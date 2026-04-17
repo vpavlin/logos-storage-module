@@ -105,6 +105,10 @@ public:
     StdLogosResult downloadToUrl(const std::string& cid, const std::string& filePath,
                                   bool local, int64_t chunkSize);
 
+    // 3-param wrapper for codegen compatibility (max 3 params in generated IPC)
+    StdLogosResult downloadFile(const std::string& cid, const std::string& filePath,
+                                bool local);
+
     // Download content by CID as a chunk stream.
     // Chunks are delivered via "storageDownloadProgress" events (chunk field in JSON).
     // Returns a StdLogosResult with the session ID (= CID) as value on success.

@@ -636,6 +636,12 @@ StdLogosResult StorageModuleImpl::downloadToUrl(const std::string& cid,
     return {true, sessionId, ""};
 }
 
+StdLogosResult StorageModuleImpl::downloadFile(const std::string& cid,
+                                                const std::string& filePath,
+                                                bool local) {
+    return downloadToUrl(cid, filePath, local, 65536);
+}
+
 StdLogosResult StorageModuleImpl::downloadChunks(const std::string& cid, bool local,
                                                   int64_t chunkSize) {
     std::string sessionId = downloadChunksInternal(cid, "", local, chunkSize);
