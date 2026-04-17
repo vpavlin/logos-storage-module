@@ -378,6 +378,39 @@ void StorageModuleImpl::emitEventSafe(const std::string& name,
 }
 
 // ---------------------------------------------------------------------------
+// JSON-string wrappers (workaround for LogosResult serialization issue)
+// ---------------------------------------------------------------------------
+
+static std::string stdLogosResultToJson(const StdLogosResult& r) {
+    json j;
+    j["success"] = r.success;
+    if (r.success) {
+        j["value"] = r.value;
+    } else {
+        j["error"] = r.error;
+    }
+    return j.dump();
+}
+
+std::string StorageModuleImpl::manifestsJson() {
+    return stdLogosResultToJson(manifests());
+}
+
+std::string StorageModuleImpl::uploadUrlJson(const std::string& filePath, int64_t chunkSize) {
+    return stdLogosResultToJson(uploadUrl(filePath, chunkSize));
+}
+
+std::string StorageModuleImpl::existsJson(const std::string& cid) {
+    return stdLogosResultToJson(exists(cid));
+}
+
+std::string StorageModuleImpl::downloadFileJson(const std::string& cid,
+                                                  const std::string& filePath,
+                                                  bool local) {
+    return stdLogosResultToJson(downloadToUrl(cid, filePath, local, 65536));
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 

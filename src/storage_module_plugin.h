@@ -152,6 +152,14 @@ public:
     // Uploads each regular file found; does not wait for uploads to complete.
     void importFiles(const std::string& path);
 
+    // JSON-string wrappers — avoid LogosResult return type which Basecamp's
+    // current ModuleProxy can't serialize across QRemoteObjects.
+    // Each returns a JSON object: {"success":bool, "value":<data>, "error":<msg>}
+    std::string manifestsJson();
+    std::string uploadUrlJson(const std::string& filePath, int64_t chunkSize);
+    std::string existsJson(const std::string& cid);
+    std::string downloadFileJson(const std::string& cid, const std::string& filePath, bool local);
+
     void emitEventSafe(const std::string& name, const std::string& data) const;
 
 private:
