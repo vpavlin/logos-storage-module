@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -439,10 +440,16 @@ bool StorageModuleImpl::start() {
     auto* ctx = new SimpleEventCtx(this, "storageStart");
     ctx->isStartedFlag = &isStarted;
     ctx->flagValueOnOk = true;
-    if (storage_start(storageCtx, asyncDispatch, ctx) != RET_OK) {
-        delete ctx;
-        return false;
-    }
+
+    // storage_start blocks for ~30s while libstorage initialises discovery
+    // and binds transport. Run it on a detached thread so the IPC return
+    // is immediate; readiness is signalled via the "storageStart" event.
+    auto* sctx = storageCtx;
+    std::thread([sctx, ctx]() {
+        if (storage_start(sctx, asyncDispatch, ctx) != RET_OK) {
+            delete ctx;
+        }
+    }).detach();
     return true;
 }
 
